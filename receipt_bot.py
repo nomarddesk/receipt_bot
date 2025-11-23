@@ -3,11 +3,11 @@ import logging
 import json
 import base64
 import time
+import re
 from typing import Optional, Dict, Any
+from functools import partial
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-from PIL import Image
-import io
 import gspread
 from google.oauth2.service_account import Credentials
 from openai import OpenAI
@@ -24,17 +24,355 @@ OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')
 WORKSHEET_NAME = os.getenv('WORKSHEET_NAME', 'Sheet1')
 
+def clean_amount(amount_str: str) -> str:
+    """Clean and sanitize amount string by removing currency symbols and commas."""
+    if not amount_str or amount_str == 'Unknown':
+        return 'Unknown'
+    
+    # Remove common currency symbols and commas
+    cleaned = re.sub(r'[₦$€£, ]', '', str(amount_str))
+    
+    # Ensure it's a valid number format
+    if re.match(r'^\d*\.?\d+$', cleaned):
+        return cleaned
+    else:
+        logging.warning(f"Amount '{amount_str}' could not be cleaned properly")
+        return amount_str
+
+def extract_json_from_response(content: str) -> Optional[Dict[str, Any]]:
+    """Extract JSON from OpenAI response, handling markdown code fences."""
+    if not content:
+        return None
+    
+    try:
+        # 1. Try raw parsing first (GPT-4o with response_format should return pure JSON)
+        return json.loads(content.strip())
+    except json.JSONDecodeError:
+        # 2. Fallback: Extract JSON from markdown code fences
+        json_pattern = r'```(?:json)?\s*(.*?)\s*```'
+        match = re.search(json_pattern, content, re.DOTALL)
+        
+        if match:
+            json_content = match.group(1).strip()
+            try:
+                return json.loads(json_content)
+            except json.JSONDecodeError as e:
+                logging.error(f"Failed to parse JSON inside code fence: {e}")
+                return None
+        
+        logging.error("Failed to parse JSON from response")
+        return None
+    except Exception as e:
+        logging.error(f"Unexpected error extracting JSON: {e}")
+        return None
+
 def load_credentials_data() -> Dict[str, Any]:
-    """
-    Load Google credentials data, prioritizing JSON string from environment variable.
-    This is the recommended approach for cloud deployments.
-    """
-    # First, try to load from environment variable (cloud deployment)
+    """Load Google credentials with multiple fallback strategies."""
+    # 1. Environment variable (cloud deployment)
     credentials_json = os.getenv('GOOGLE_CREDENTIALS_JSON')
     if credentials_json:
         try:
-            logging.info("Loading credentials from GOOGLE_CREDENTIALS_JSON environment variable")
-            return json.loads(credentials_json)
+            logging.info("Loading credentials from GOOGLE_CREDENTIALS_JSON")
+            
+            # Try base64 decoding first (common in cloud deployments)
+            try:
+                decoded_credentials = base64.b64decode(credentials_json).decode('utf-8')
+                logging.info("Successfully decoded base64-encoded credentials")
+                return json.loads(decoded_credentials)
+            except (base64.binascii.Error, UnicodeDecodeError):
+                # Fall back to plain JSON
+                logging.info("Parsing credentials as plain JSON")
+                return json.loads(credentials_json)
+                
+        except json.JSONDecodeError as e:
+            logging.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
+    
+    # 2. File-based fallback (local development)
+    possible_paths = [
+        '/etc/secrets/credentials.json',  # Render secret files
+        'credentials.json',               # Local development
+        '/app/credentials.json',          # Container path
+    ]
+    
+    for path in possible_paths:
+        if os.path.exists(path):
+            try:
+                logging.info(f"Loading credentials from file: {path}")
+                with open(path, 'r') as f:
+                    file_content = f.read()
+                return json.loads(file_content)
+            except Exception as e:
+                logging.error(f"Failed to load credentials from {path}: {e}")
+                continue
+    
+    raise FileNotFoundError(
+        "Google credentials not found. Set GOOGLE_CREDENTIALS_JSON environment variable "
+        "or provide credentials.json file."
+    )
+
+def initialize_google_sheet(max_retries: int = 3) -> Optional[gspread.Worksheet]:
+    """Initialize Google Sheets connection with retry logic."""
+    logging.info("Initializing Google Sheets connection...")
+    
+    for attempt in range(max_retries):
+        try:
+            credentials_data = load_credentials_data()
+            
+            if not SPREADSHEET_ID:
+                raise ValueError("SPREADSHEET_ID environment variable is not set!")
+            
+            # Authenticate and connect
+            creds = Credentials.from_service_account_info(credentials_data)
+            gc = gspread.authorize(creds)
+            spreadsheet = gc.open_by_key(SPREADSHEET_ID)
+            worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
+            
+            # Initialize headers if sheet is empty
+            if not worksheet.get_all_records():
+                headers = ["Date", "Store/Merchant", "Total Amount", "Currency", "Transaction Type", "Items", "Timestamp"]
+                worksheet.append_row(headers)
+                logging.info("Created headers in Google Sheet")
+            
+            logging.info(f"✅ Google Sheets connection successful. Using Sheet ID: {SPREADSHEET_ID}")
+            return worksheet
+            
+        except gspread.exceptions.APIError as e:
+            logging.error(f"Google Sheets API Error on attempt {attempt + 1}: {e}")
+            if "PERMISSION_DENIED" in str(e):
+                logging.error("🔐 Permission denied. Ensure service account has editor access.")
+                raise
+        except Exception as e:
+            logging.error(f"Error initializing Google Sheets on attempt {attempt + 1}: {e}")
+            
+        if attempt < max_retries - 1:
+            wait_time = 2 ** attempt
+            logging.info(f"Retrying in {wait_time} seconds...")
+            time.sleep(wait_time)
+    
+    logging.error("❌ Failed to initialize Google Sheets after all retries")
+    return None
+
+def get_openai_client() -> OpenAI:
+    """Initialize and return OpenAI client."""
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is not set!")
+    return OpenAI(api_key=OPENAI_API_KEY)
+
+def extract_receipt_info_with_openai(image_bytes: bytes) -> Optional[Dict[str, Any]]:
+    """Extract receipt information using OpenAI GPT-4 Vision."""
+    try:
+        client = get_openai_client()
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",
+            messages=[
+                {
+                    "role": "system",
+                    "content": "You are a precise receipt analysis assistant. Return ONLY the valid JSON object content. Do not include markdown code fences."
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Analyze this receipt and extract information as JSON with these exact fields:
+                            - store: store or merchant name
+                            - date: transaction date (YYYY-MM-DD format)
+                            - total_amount: total amount paid (numerical value only)
+                            - currency: currency used (e.g., NGN, USD, EUR)
+                            - transaction_type: payment type
+                            - items: list of items or description
+                            
+                            Rules:
+                            - Use "Unknown" for unavailable information
+                            - For Nigerian receipts, currency should be NGN
+                            - Return only raw JSON, no markdown"""
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            response_format={"type": "json_object"},
+            max_tokens=1000
+        )
+        
+        content = response.choices[0].message.content
+        logging.info(f"OpenAI Raw Response: {content}")
+        
+        # Extract and parse JSON from response
+        receipt_data = extract_json_from_response(content)
+        if not receipt_data:
+            return None
+        
+        # Validate and clean required fields
+        required_fields = ['store', 'date', 'total_amount', 'currency', 'transaction_type', 'items']
+        for field in required_fields:
+            if field not in receipt_data:
+                receipt_data[field] = "Unknown"
+            elif field == 'total_amount' and receipt_data[field] != "Unknown":
+                receipt_data[field] = clean_amount(receipt_data[field])
+        
+        logging.info(f"✅ Processed receipt data: {receipt_data}")
+        return receipt_data
+        
+    except Exception as e:
+        logging.error(f"OpenAI Vision error: {str(e)}")
+        return None
+
+# Bot command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome to Receipt Bot!\n\n"
+        "Send me a photo of your receipt and I'll extract the information "
+        "and save it to your spreadsheet.\n\n"
+        "Supported formats:\n"
+        "• Store receipts\n• Food receipts\n• Shopping receipts\n"
+        "• Payment transfers\n• Bank transactions\n\n"
+        "Just snap a clear photo and send it to me!"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 How to use Receipt Bot:\n\n"
+        "1. Take a clear photo of your receipt\n"
+        "2. Send the photo to this chat\n"
+        "3. I'll extract the details and save them\n\n"
+        "Tips for better results:\n"
+        "• Ensure good lighting\n• Keep receipt flat\n• Avoid glare\n• Capture entire receipt"
+    )
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    processing_msg = None
+    try:
+        # Check prerequisites
+        worksheet = context.bot_data.get('worksheet')
+        if not worksheet:
+            await update.message.reply_text("❌ Bot configuration error: Spreadsheet not available.")
+            return
+        
+        if not OPENAI_API_KEY:
+            await update.message.reply_text("❌ OpenAI API key not configured.")
+            return
+        
+        # Send processing message
+        processing_msg = await update.message.reply_text("🔄 Processing your receipt with AI...")
+        
+        # Get and download photo
+        photo_file = await update.message.photo[-1].get_file()
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        # Extract receipt information
+        receipt_data = extract_receipt_info_with_openai(photo_bytes)
+        
+        if not receipt_data:
+            if processing_msg: 
+                await processing_msg.delete()
+            await update.message.reply_text("❌ Sorry, I couldn't process that receipt. Please try again.")
+            return
+        
+        # Prepare data for Google Sheets
+        timestamp = update.message.date.strftime("%Y-%m-%d %H:%M:%S")
+        row_data = [
+            receipt_data.get('date', 'Unknown'),
+            receipt_data.get('store', 'Unknown'),
+            receipt_data.get('total_amount', 'Unknown'),
+            receipt_data.get('currency', 'Unknown'),
+            receipt_data.get('transaction_type', 'Unknown'),
+            receipt_data.get('items', 'Unknown'),
+            timestamp
+        ]
+
+        # 🚀 CRITICAL: Run synchronous Sheets operation in executor to avoid blocking
+        try:
+            logging.info("Starting Sheets write operation in executor...")
+            save_func = partial(worksheet.append_row, row_data)
+            await context.application.loop.run_in_executor(None, save_func)
+            logging.info("Sheets write successful.")
+            
+            # Success response
+            response = "✅ Receipt processed and saved!\n\n"
+            response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
+            response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
+            response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
+            response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"
+            
+            items = receipt_data.get('items', 'Unknown')
+            if items and items != 'Unknown':
+                response += f"🛍️ Items: {items}\n"
+            
+            if processing_msg: 
+                await processing_msg.delete()
+            await update.message.reply_text(response)
+            
+        except Exception as sheets_error:
+            logging.error(f"Google Sheets save error: {sheets_error}")
+            # Show extracted data even if save fails
+            response = "📄 Receipt processed successfully!\n\n"
+            response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
+            response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
+            response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
+            response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n\n"
+            response += "⚠️ Data extracted but couldn't save to spreadsheet."
+            
+            if processing_msg: 
+                await processing_msg.delete()
+            await update.message.reply_text(response)
+            
+    except Exception as e:
+        logging.error(f"Unexpected error: {str(e)}")
+        try:
+            if processing_msg:
+                await processing_msg.delete()
+        except:
+            pass
+        await update.message.reply_text("❌ An unexpected error occurred. Please try again.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "I only process receipt images. Send a photo of your receipt or use /help for instructions."
+    )
+
+def main():
+    # Validate required environment variables
+    required_vars = ['BOT_TOKEN', 'OPENAI_API_KEY', 'SPREADSHEET_ID']
+    missing_vars = [var for var in required_vars if not os.getenv(var)]
+    
+    if missing_vars:
+        logging.error(f"❌ Missing environment variables: {', '.join(missing_vars)}")
+        return
+    
+    # Initialize application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Initialize Google Sheets connection once at startup
+    try:
+        worksheet = initialize_google_sheet()
+        if worksheet:
+            application.bot_data['worksheet'] = worksheet
+            logging.info("✅ Google Sheets worksheet stored in bot_data for reuse")
+        else:
+            logging.error("❌ Failed to initialize Google Sheets connection")
+    except Exception as e:
+        logging.error(f"❌ Failed to initialize Google Sheets: {e}")
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start bot
+    logging.info("🚀 Bot starting with optimized Google Sheets connection...")
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
+
+if __name__ == "__main__":
+    main()            return json.loads(credentials_json)
         except json.JSONDecodeError as e:
             logging.error(f"Failed to parse GOOGLE_CREDENTIALS_JSON: {e}")
             # Fall through to file-based loading
