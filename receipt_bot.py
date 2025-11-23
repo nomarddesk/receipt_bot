@@ -1,15 +1,14 @@
 import os
 import logging
+import json
+import base64
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
-import pytesseract
 from PIL import Image
 import io
-import re
 import gspread
 from google.oauth2.service_account import Credentials
-import cv2
-import numpy as np
+from openai import OpenAI
 
 # Configure logging
 logging.basicConfig(
@@ -19,7 +18,11 @@ logging.basicConfig(
 
 # Configuration from environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
+OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 SPREADSHEET_NAME = os.getenv('SPREADSHEET_NAME', 'Receipt Tracker')
+
+# Initialize OpenAI client
+client = OpenAI(api_key=OPENAI_API_KEY)
 
 # For Render.com - we'll use the secret file path
 def setup_google_sheets():
@@ -38,103 +41,130 @@ def setup_google_sheets():
         
         # Create headers if sheet is empty
         if not sheet.get_all_records():
-            sheet.append_row(["Date", "Store", "Total Amount", "Items", "Timestamp"])
+            sheet.append_row(["Date", "Store/Merchant", "Total Amount", "Currency", "Transaction Type", "Items", "Timestamp"])
         
         return sheet
     except Exception as e:
         logging.error(f"Google Sheets setup error: {e}")
         raise
 
-# Preprocess image for better OCR
-def preprocess_image(image):
+def extract_receipt_info_with_openai(image_bytes):
+    """Extract receipt information using OpenAI GPT-4 Vision"""
     try:
-        # Convert to numpy array
-        img = np.array(image)
+        # Convert image to base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
-        # Convert to grayscale
-        gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+        response = client.chat.completions.create(
+            model="gpt-4-vision-preview",
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Analyze this receipt image and extract the following information in JSON format:
+                            {
+                                "store": "store or merchant name",
+                                "date": "transaction date",
+                                "total_amount": "total amount paid",
+                                "currency": "currency used",
+                                "transaction_type": "payment type e.g., transfer, purchase, etc.",
+                                "items": "list of items purchased or description"
+                            }
+                            
+                            Rules:
+                            - If information is not available, use "Unknown"
+                            - For amounts, extract only the numerical value without symbols
+                            - For dates, use YYYY-MM-DD format if possible
+                            - For items, provide a concise description
+                            - Be accurate with the currency
+                            """
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000
+        )
         
-        # Apply noise reduction
-        denoised = cv2.medianBlur(gray, 5)
+        # Extract JSON from response
+        content = response.choices[0].message.content
+        logging.info(f"OpenAI Response: {content}")
         
-        # Apply thresholding
-        _, thresh = cv2.threshold(denoised, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-        
-        return Image.fromarray(thresh)
+        # Try to parse JSON from the response
+        try:
+            # Extract JSON if it's wrapped in markdown code blocks
+            if "```json" in content:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                json_str = content.split("```")[1].split("```")[0].strip()
+            else:
+                json_str = content.strip()
+            
+            receipt_data = json.loads(json_str)
+            return receipt_data
+            
+        except json.JSONDecodeError:
+            # If JSON parsing fails, try to extract key information manually
+            logging.warning("Failed to parse JSON, extracting manually")
+            return extract_info_manually(content)
+            
     except Exception as e:
-        logging.error(f"Image preprocessing error: {e}")
-        return image  # Return original if processing fails
+        logging.error(f"OpenAI Vision error: {e}")
+        return {}
 
-# Extract receipt information using OCR
-def extract_receipt_info(image):
-    try:
-        # Preprocess image
-        processed_image = preprocess_image(image)
-        
-        # Perform OCR
-        text = pytesseract.image_to_string(processed_image)
-        
-        # Parse the extracted text
-        receipt_data = parse_receipt_text(text)
-        
-        return receipt_data, text
-    except Exception as e:
-        logging.error(f"OCR extraction error: {e}")
-        return {}, ""
-
-def parse_receipt_text(text):
+def extract_info_manually(content):
+    """Fallback method to extract information from text response"""
     data = {
-        'date': '',
-        'store': '',
-        'total': '',
-        'items': ''
+        "store": "Unknown",
+        "date": "Unknown", 
+        "total_amount": "Unknown",
+        "currency": "Unknown",
+        "transaction_type": "Unknown",
+        "items": "Unknown"
     }
     
-    lines = text.split('\n')
+    # Simple pattern matching as fallback
+    content_lower = content.lower()
     
-    # Look for date patterns
+    # Look for store/merchant
+    if "opay" in content_lower:
+        data["store"] = "OPay"
+    
+    # Look for amount
+    import re
+    amount_match = re.search(r'(\d+[,.]?\d*\.?\d{0,2})', content)
+    if amount_match:
+        data["total_amount"] = amount_match.group(1).replace(',', '')
+    
+    # Look for date
     date_patterns = [
-        r'\d{1,2}/\d{1,2}/\d{2,4}',
-        r'\d{1,2}-\d{1,2}-\d{2,4}',
-        r'\d{1,2}\.\d{1,2}\.\d{2,4}'
+        r'\d{4}-\d{2}-\d{2}',
+        r'\d{1,2}/\d{1,2}/\d{4}',
+        r'\d{1,2}-\d{1,2}-\d{4}',
+        r'\w+ \d{1,2}(?:st|nd|rd|th)?,? \d{4}'
     ]
     
-    # Look for total amount
-    total_patterns = [
-        r'total.*?(\d+\.\d{2})',
-        r'amount.*?(\d+\.\d{2})',
-        r'balance.*?(\d+\.\d{2})',
-        r'(\d+\.\d{2})\s*(?:total|amount|balance)',
-        r'^.*?(\d+\.\d{2})\s*$'
-    ]
+    for pattern in date_patterns:
+        date_match = re.search(pattern, content, re.IGNORECASE)
+        if date_match:
+            data["date"] = date_match.group()
+            break
     
-    # Store name (usually at the top)
-    if lines:
-        data['store'] = lines[0].strip()[:50]  # Limit length
+    # Look for currency
+    if "₦" in content or "naira" in content_lower or "ngn" in content_lower:
+        data["currency"] = "NGN"
     
-    # Extract date
-    for line in lines:
-        for pattern in date_patterns:
-            match = re.search(pattern, line.lower())
-            if match:
-                data['date'] = match.group()
-                break
-    
-    # Extract total
-    for line in lines:
-        for pattern in total_patterns:
-            match = re.search(pattern, line.lower())
-            if match:
-                data['total'] = match.group(1)
-                break
-    
-    # Extract items (simplified)
-    item_lines = []
-    for line in lines:
-        if re.search(r'\d+\.\d{2}', line) and not any(keyword in line.lower() for keyword in ['total', 'tax', 'subtotal', 'amount']):
-            item_lines.append(line.strip())
-    
-    data['items'] = '; '.join(item_lines[:5])[:200]  # Limit to 5 items and 200 chars
+    # Look for transaction type
+    if "transfer" in content_lower or "sent" in content_lower:
+        data["transaction_type"] = "Transfer"
+    elif "purchase" in content_lower or "payment" in content_lower:
+        data["transaction_type"] = "Purchase"
     
     return data
 
@@ -146,8 +176,10 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "and save it to your spreadsheet.\n\n"
         "Supported formats:\n"
         "• Store receipts\n"
-        "• Food receipts\n"
-        "• Shopping receipts\n\n"
+        "• Food receipts\n" 
+        "• Shopping receipts\n"
+        "• Payment transfers\n"
+        "• Bank transactions\n\n"
         "Just snap a clear photo and send it to me!"
     )
 
@@ -167,29 +199,33 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         # Send processing message
-        processing_msg = await update.message.reply_text("🔄 Processing your receipt...")
+        processing_msg = await update.message.reply_text("🔄 Processing your receipt with AI...")
         
         # Get the photo file
         photo_file = await update.message.photo[-1].get_file()
         
-        # Download photo
+        # Download photo as bytes
         photo_bytes = await photo_file.download_as_bytearray()
         
-        # Convert to PIL Image
-        image = Image.open(io.BytesIO(photo_bytes))
+        # Extract receipt information using OpenAI
+        receipt_data = extract_receipt_info_with_openai(photo_bytes)
         
-        # Extract receipt information
-        receipt_data, raw_text = extract_receipt_info(image)
+        if not receipt_data:
+            await processing_msg.delete()
+            await update.message.reply_text("❌ Sorry, I couldn't process that receipt. Please try again.")
+            return
         
         # Save to Google Sheets
         sheet = setup_google_sheets()
         timestamp = update.message.date.strftime("%Y-%m-%d %H:%M:%S")
         
         row_data = [
-            receipt_data['date'],
-            receipt_data['store'],
-            receipt_data['total'],
-            receipt_data['items'],
+            receipt_data.get('date', 'Unknown'),
+            receipt_data.get('store', 'Unknown'),
+            receipt_data.get('total_amount', 'Unknown'),
+            receipt_data.get('currency', 'Unknown'),
+            receipt_data.get('transaction_type', 'Unknown'),
+            receipt_data.get('items', 'Unknown'),
             timestamp
         ]
         
@@ -197,18 +233,24 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Prepare response message
         response = "✅ Receipt processed and saved!\n\n"
-        response += f"🏪 Store: {receipt_data['store'] or 'Not found'}\n"
-        response += f"📅 Date: {receipt_data['date'] or 'Not found'}\n"
-        response += f"💰 Total: ${receipt_data['total'] or 'Not found'}\n"
+        response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
+        response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
+        response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
+        response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"
         
-        if receipt_data['items']:
-            response += f"🛍️ Items: {receipt_data['items']}\n"
+        items = receipt_data.get('items', 'Unknown')
+        if items and items != 'Unknown':
+            response += f"🛍️ Items: {items}\n"
         
         await processing_msg.delete()
         await update.message.reply_text(response)
         
     except Exception as e:
         logging.error(f"Error processing receipt: {e}")
+        try:
+            await processing_msg.delete()
+        except:
+            pass
         await update.message.reply_text("❌ Sorry, I couldn't process that receipt. Please try again with a clearer image.")
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -218,9 +260,13 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 def main():
-    # Check if BOT_TOKEN is set
+    # Check if required environment variables are set
     if not BOT_TOKEN:
         logging.error("BOT_TOKEN environment variable is not set!")
+        return
+    
+    if not OPENAI_API_KEY:
+        logging.error("OPENAI_API_KEY environment variable is not set!")
         return
     
     # Create application
@@ -233,7 +279,7 @@ def main():
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
     # Start bot
-    logging.info("Bot is starting...")
+    logging.info("Bot is starting with OpenAI Vision...")
     application.run_polling()
 
 if __name__ == "__main__":
