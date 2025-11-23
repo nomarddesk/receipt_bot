@@ -19,9 +19,9 @@ logging.basicConfig(
 # Configuration from environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')  # Changed to SPREADSHEET_ID
+SPREADSHEET_NAME = os.getenv('SPREADSHEET_NAME', 'Receipt Tracker')
 
-# Initialize OpenAI client
+# Initialize OpenAI client - we'll do this in a function to ensure env var is loaded
 def get_openai_client():
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY environment variable is not set!")
@@ -30,11 +30,273 @@ def get_openai_client():
 # For Render.com - we'll use the secret file path
 def setup_google_sheets():
     try:
-        # On Render, secret files are mounted at /etc/secrets/
-        possible_paths = [
-            '/etc/secrets/credentials.json',  # Render secret files path
-            'credentials.json',  # Local development
-            '/app/credentials.json',  # Absolute path in container
+        # On Render, the secret file is mounted at /etc/secrets/
+        creds_path = '/etc/secrets/credentials.json'
+        
+        # Fallback for local development
+        if not os.path.exists(creds_path):
+            creds_path = 'credentials.json'
+            
+        scope = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+        client = gspread.authorize(creds)
+        sheet = client.open(SPREADSHEET_NAME).sheet1
+        
+        # Create headers if sheet is empty
+        if not sheet.get_all_records():
+            sheet.append_row(["Date", "Store/Merchant", "Total Amount", "Currency", "Transaction Type", "Items", "Timestamp"])
+        
+        return sheet
+    except Exception as e:
+        logging.error(f"Google Sheets setup error: {e}")
+        raise
+
+def extract_receipt_info_with_openai(image_bytes):
+    """Extract receipt information using OpenAI GPT-4 Vision"""
+    try:
+        # Get OpenAI client
+        client = get_openai_client()
+        
+        # Convert image to base64
+        base64_image = base64.b64encode(image_bytes).decode('utf-8')
+        
+        response = client.chat.completions.create(
+            model="gpt-4o",  # Using GPT-4o which is newer and cheaper
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": """Analyze this receipt or transaction image and extract the following information in JSON format:
+                            {
+                                "store": "store or merchant name",
+                                "date": "transaction date",
+                                "total_amount": "total amount paid",
+                                "currency": "currency used",
+                                "transaction_type": "payment type e.g., transfer, purchase, etc.",
+                                "items": "list of items purchased or description"
+                            }
+                            
+                            Rules:
+                            - If information is not available, use "Unknown"
+                            - For amounts, extract only the numerical value without symbols
+                            - For dates, use YYYY-MM-DD format if possible
+                            - For items, provide a concise description
+                            - Be accurate with the currency
+                            - For Nigerian receipts, currency is usually NGN
+                            """
+                        },
+                        {
+                            "type": "image_url",
+                            "image_url": {
+                                "url": f"data:image/jpeg;base64,{base64_image}"
+                            }
+                        }
+                    ]
+                }
+            ],
+            max_tokens=1000
+        )
+        
+        # Extract JSON from response
+        content = response.choices[0].message.content
+        logging.info(f"OpenAI Response: {content}")
+        
+        # Try to parse JSON from the response
+        try:
+            # Extract JSON if it's wrapped in markdown code blocks
+            if "```json" in content:
+                json_str = content.split("```json")[1].split("```")[0].strip()
+            elif "```" in content:
+                json_str = content.split("```")[1].split("```")[0].strip()
+            else:
+                json_str = content.strip()
+            
+            receipt_data = json.loads(json_str)
+            return receipt_data
+            
+        except json.JSONDecodeError:
+            # If JSON parsing fails, try to extract key information manually
+            logging.warning("Failed to parse JSON, extracting manually")
+            return extract_info_manually(content)
+            
+    except Exception as e:
+        logging.error(f"OpenAI Vision error: {e}")
+        return {}
+
+def extract_info_manually(content):
+    """Fallback method to extract information from text response"""
+    data = {
+        "store": "Unknown",
+        "date": "Unknown", 
+        "total_amount": "Unknown",
+        "currency": "Unknown",
+        "transaction_type": "Unknown",
+        "items": "Unknown"
+    }
+    
+    # Simple pattern matching as fallback
+    content_lower = content.lower()
+    
+    # Look for store/merchant
+    if "opay" in content_lower:
+        data["store"] = "OPay"
+    
+    # Look for amount
+    import re
+    amount_match = re.search(r'(\d+[,.]?\d*\.?\d{0,2})', content)
+    if amount_match:
+        data["total_amount"] = amount_match.group(1).replace(',', '')
+    
+    # Look for date
+    date_patterns = [
+        r'\d{4}-\d{2}-\d{2}',
+        r'\d{1,2}/\d{1,2}/\d{4}',
+        r'\d{1,2}-\d{1,2}-\d{4}',
+        r'\w+ \d{1,2}(?:st|nd|rd|th)?,? \d{4}'
+    ]
+    
+    for pattern in date_patterns:
+        date_match = re.search(pattern, content, re.IGNORECASE)
+        if date_match:
+            data["date"] = date_match.group()
+            break
+    
+    # Look for currency
+    if "₦" in content or "naira" in content_lower or "ngn" in content_lower:
+        data["currency"] = "NGN"
+    
+    # Look for transaction type
+    if "transfer" in content_lower or "sent" in content_lower:
+        data["transaction_type"] = "Transfer"
+    elif "purchase" in content_lower or "payment" in content_lower:
+        data["transaction_type"] = "Purchase"
+    
+    return data
+
+# Bot command handlers
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "👋 Welcome to Receipt Bot!\n\n"
+        "Simply send me a photo of your receipt and I'll extract the information "
+        "and save it to your spreadsheet.\n\n"
+        "Supported formats:\n"
+        "• Store receipts\n"
+        "• Food receipts\n" 
+        "• Shopping receipts\n"
+        "• Payment transfers\n"
+        "• Bank transactions\n\n"
+        "Just snap a clear photo and send it to me!"
+    )
+
+async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "📖 How to use Receipt Bot:\n\n"
+        "1. Take a clear photo of your receipt\n"
+        "2. Send the photo to this chat\n"
+        "3. I'll extract the details and save them\n\n"
+        "Tips for better results:\n"
+        "• Ensure good lighting\n"
+        "• Keep the receipt flat\n"
+        "• Avoid glare and shadows\n"
+        "• Capture the entire receipt"
+    )
+
+async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        # Check if OpenAI API key is available
+        if not OPENAI_API_KEY:
+            await update.message.reply_text("❌ OpenAI API key is not configured. Please contact the bot administrator.")
+            return
+        
+        # Send processing message
+        processing_msg = await update.message.reply_text("🔄 Processing your receipt with AI...")
+        
+        # Get the photo file
+        photo_file = await update.message.photo[-1].get_file()
+        
+        # Download photo as bytes
+        photo_bytes = await photo_file.download_as_bytearray()
+        
+        # Extract receipt information using OpenAI
+        receipt_data = extract_receipt_info_with_openai(photo_bytes)
+        
+        if not receipt_data:
+            await processing_msg.delete()
+            await update.message.reply_text("❌ Sorry, I couldn't process that receipt. Please try again.")
+            return
+        
+        # Save to Google Sheets
+        sheet = setup_google_sheets()
+        timestamp = update.message.date.strftime("%Y-%m-%d %H:%M:%S")
+        
+        row_data = [
+            receipt_data.get('date', 'Unknown'),
+            receipt_data.get('store', 'Unknown'),
+            receipt_data.get('total_amount', 'Unknown'),
+            receipt_data.get('currency', 'Unknown'),
+            receipt_data.get('transaction_type', 'Unknown'),
+            receipt_data.get('items', 'Unknown'),
+            timestamp
+        ]
+        
+        sheet.append_row(row_data)
+        
+        # Prepare response message
+        response = "✅ Receipt processed and saved!\n\n"
+        response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
+        response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
+        response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
+        response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"
+        
+        items = receipt_data.get('items', 'Unknown')
+        if items and items != 'Unknown':
+            response += f"🛍️ Items: {items}\n"
+        
+        await processing_msg.delete()
+        await update.message.reply_text(response)
+        
+    except Exception as e:
+        logging.error(f"Error processing receipt: {e}")
+        try:
+            await processing_msg.delete()
+        except:
+            pass
+        await update.message.reply_text("❌ Sorry, I couldn't process that receipt. Please try again with a clearer image.")
+
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "I only process receipt images right now. "
+        "Please send a photo of your receipt, or use /help for instructions."
+    )
+
+def main():
+    # Check if required environment variables are set
+    if not BOT_TOKEN:
+        logging.error("BOT_TOKEN environment variable is not set!")
+        return
+    
+    if not OPENAI_API_KEY:
+        logging.error("OPENAI_API_KEY environment variable is not set!")
+        logging.error("Please set the OPENAI_API_KEY environment variable in your Render dashboard")
+        return
+    
+    # Create application
+    application = Application.builder().token(BOT_TOKEN).build()
+    
+    # Add handlers
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("help", help_command))
+    application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    
+    # Start bot
+    logging.info("Bot is starting with OpenAI Vision...")
+    application.run_polling()
+
+if __name__ == "__main__":
+    main()            '/app/credentials.json',  # Absolute path in container
         ]
         
         creds_path = None
