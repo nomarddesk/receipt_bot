@@ -21,8 +21,11 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 SPREADSHEET_NAME = os.getenv('SPREADSHEET_NAME', 'Receipt Tracker')
 
-# Initialize OpenAI client
-client = OpenAI(api_key=OPENAI_API_KEY)
+# Initialize OpenAI client - we'll do this in a function to ensure env var is loaded
+def get_openai_client():
+    if not OPENAI_API_KEY:
+        raise ValueError("OPENAI_API_KEY environment variable is not set!")
+    return OpenAI(api_key=OPENAI_API_KEY)
 
 # For Render.com - we'll use the secret file path
 def setup_google_sheets():
@@ -51,18 +54,21 @@ def setup_google_sheets():
 def extract_receipt_info_with_openai(image_bytes):
     """Extract receipt information using OpenAI GPT-4 Vision"""
     try:
+        # Get OpenAI client
+        client = get_openai_client()
+        
         # Convert image to base64
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
         response = client.chat.completions.create(
-            model="gpt-4-vision-preview",
+            model="gpt-4o",  # Using GPT-4o which is newer and cheaper
             messages=[
                 {
                     "role": "user",
                     "content": [
                         {
                             "type": "text",
-                            "text": """Analyze this receipt image and extract the following information in JSON format:
+                            "text": """Analyze this receipt or transaction image and extract the following information in JSON format:
                             {
                                 "store": "store or merchant name",
                                 "date": "transaction date",
@@ -78,6 +84,7 @@ def extract_receipt_info_with_openai(image_bytes):
                             - For dates, use YYYY-MM-DD format if possible
                             - For items, provide a concise description
                             - Be accurate with the currency
+                            - For Nigerian receipts, currency is usually NGN
                             """
                         },
                         {
@@ -198,6 +205,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
+        # Check if OpenAI API key is available
+        if not OPENAI_API_KEY:
+            await update.message.reply_text("❌ OpenAI API key is not configured. Please contact the bot administrator.")
+            return
+        
         # Send processing message
         processing_msg = await update.message.reply_text("🔄 Processing your receipt with AI...")
         
@@ -267,6 +279,7 @@ def main():
     
     if not OPENAI_API_KEY:
         logging.error("OPENAI_API_KEY environment variable is not set!")
+        logging.error("Please set the OPENAI_API_KEY environment variable in your Render dashboard")
         return
     
     # Create application
