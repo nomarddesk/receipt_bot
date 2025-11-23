@@ -134,8 +134,9 @@ def extract_receipt_info_with_openai(image_bytes):
             return extract_info_manually(content)
             
     except Exception as e:
-        logging.error(f"OpenAI Vision error: {e}")
-        return {}
+        logging.error(f"OpenAI Vision error: {str(e)}")
+        # Return the actual error for debugging
+        return {"error": f"OpenAI Error: {str(e)}"}
 
 def extract_info_manually(content):
     """Fallback method to extract information from text response"""
@@ -216,6 +217,7 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     )
 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    processing_msg = None
     try:
         # Check if OpenAI API key is available
         if not OPENAI_API_KEY:
@@ -233,6 +235,28 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Extract receipt information using OpenAI
         receipt_data = extract_receipt_info_with_openai(photo_bytes)
+        
+        # Check if there was an OpenAI error
+        if "error" in receipt_data:
+            error_message = receipt_data["error"]
+            await processing_msg.delete()
+            
+            # Provide specific guidance based on error type
+            if "quota" in error_message.lower() or "billing" in error_message.lower() or "429" in error_message:
+                response = "❌ OpenAI API Error: You've exceeded your quota or need to add billing.\n\n"
+                response += "Please:\n"
+                response += "1. Go to platform.openai.com\n"
+                response += "2. Check your billing and usage\n"
+                response += "3. Add payment method if needed\n"
+                response += f"\nFull Error: {error_message}"
+            elif "invalid api key" in error_message.lower():
+                response = "❌ OpenAI API Error: Invalid API Key\n\n"
+                response += "Please check your OPENAI_API_KEY environment variable in Render."
+            else:
+                response = f"❌ OpenAI Error: {error_message}"
+            
+            await update.message.reply_text(response)
+            return
         
         if not receipt_data:
             await processing_msg.delete()
@@ -261,7 +285,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
             response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
             response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
-            response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"
+            response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"  # FIXED: rece_data → receipt_data
             
             items = receipt_data.get('items', 'Unknown')
             if items and items != 'Unknown':
@@ -278,18 +302,22 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
             response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
             response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n\n"
-            response += "⚠️ But couldn't save to spreadsheet. Check credentials."
+            response += f"⚠️ But couldn't save to spreadsheet. Error: {str(sheets_error)}"
             
             await processing_msg.delete()
             await update.message.reply_text(response)
         
     except Exception as e:
-        logging.error(f"Error processing receipt: {e}")
+        logging.error(f"Error processing receipt: {str(e)}")
         try:
-            await processing_msg.delete()
+            if processing_msg:
+                await processing_msg.delete()
         except:
             pass
-        await update.message.reply_text("❌ Sorry, I couldn't process that receipt. Please try again with a clearer image.")
+        
+        error_response = f"❌ Error processing receipt:\n\n{str(e)}\n\n"
+        error_response += "Please try again or contact support if this continues."
+        await update.message.reply_text(error_response)
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
@@ -308,7 +336,7 @@ def main():
         logging.error("Please set the OPENAI_API_KEY environment variable in your Render dashboard")
         return
     
-    # Create application
+    # Create application with specific settings to avoid conflicts
     application = Application.builder().token(BOT_TOKEN).build()
     
     # Add handlers
@@ -317,9 +345,11 @@ def main():
     application.add_handler(MessageHandler(filters.PHOTO, handle_photo))
     application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     
-    # Start bot
+    # Start bot with specific settings
     logging.info("Bot is starting with OpenAI Vision...")
-    application.run_polling()
+    
+    # Use drop_pending_updates to avoid conflicts
+    application.run_polling(drop_pending_updates=True, allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
     main()
