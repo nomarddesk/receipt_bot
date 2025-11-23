@@ -21,7 +21,7 @@ BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
 SPREADSHEET_NAME = os.getenv('SPREADSHEET_NAME', 'Receipt Tracker')
 
-# Initialize OpenAI client - we'll do this in a function to ensure env var is loaded
+# Initialize OpenAI client
 def get_openai_client():
     if not OPENAI_API_KEY:
         raise ValueError("OPENAI_API_KEY environment variable is not set!")
@@ -30,12 +30,24 @@ def get_openai_client():
 # For Render.com - we'll use the secret file path
 def setup_google_sheets():
     try:
-        # On Render, the secret file is mounted at /etc/secrets/
-        creds_path = '/etc/secrets/credentials.json'
+        # On Render, secret files are mounted at /etc/secrets/
+        possible_paths = [
+            '/etc/secrets/credentials.json',  # Render secret files path
+            'credentials.json',  # Local development
+            '/app/credentials.json',  # Absolute path in container
+        ]
         
-        # Fallback for local development
-        if not os.path.exists(creds_path):
-            creds_path = 'credentials.json'
+        creds_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                creds_path = path
+                logging.info(f"Found credentials at: {creds_path}")
+                break
+        
+        if not creds_path:
+            logging.error("No credentials.json file found in any expected location")
+            logging.error("Checked paths: " + ", ".join(possible_paths))
+            raise FileNotFoundError("credentials.json not found")
             
         scope = ['https://www.googleapis.com/auth/spreadsheets']
         creds = Credentials.from_service_account_file(creds_path, scopes=scope)
@@ -61,7 +73,7 @@ def extract_receipt_info_with_openai(image_bytes):
         base64_image = base64.b64encode(image_bytes).decode('utf-8')
         
         response = client.chat.completions.create(
-            model="gpt-4o",  # Using GPT-4o which is newer and cheaper
+            model="gpt-4o",
             messages=[
                 {
                     "role": "user",
@@ -228,34 +240,48 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
             return
         
         # Save to Google Sheets
-        sheet = setup_google_sheets()
-        timestamp = update.message.date.strftime("%Y-%m-%d %H:%M:%S")
-        
-        row_data = [
-            receipt_data.get('date', 'Unknown'),
-            receipt_data.get('store', 'Unknown'),
-            receipt_data.get('total_amount', 'Unknown'),
-            receipt_data.get('currency', 'Unknown'),
-            receipt_data.get('transaction_type', 'Unknown'),
-            receipt_data.get('items', 'Unknown'),
-            timestamp
-        ]
-        
-        sheet.append_row(row_data)
-        
-        # Prepare response message
-        response = "✅ Receipt processed and saved!\n\n"
-        response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
-        response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
-        response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
-        response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"
-        
-        items = receipt_data.get('items', 'Unknown')
-        if items and items != 'Unknown':
-            response += f"🛍️ Items: {items}\n"
-        
-        await processing_msg.delete()
-        await update.message.reply_text(response)
+        try:
+            sheet = setup_google_sheets()
+            timestamp = update.message.date.strftime("%Y-%m-%d %H:%M:%S")
+            
+            row_data = [
+                receipt_data.get('date', 'Unknown'),
+                receipt_data.get('store', 'Unknown'),
+                receipt_data.get('total_amount', 'Unknown'),
+                receipt_data.get('currency', 'Unknown'),
+                receipt_data.get('transaction_type', 'Unknown'),
+                receipt_data.get('items', 'Unknown'),
+                timestamp
+            ]
+            
+            sheet.append_row(row_data)
+            
+            # Prepare success response message
+            response = "✅ Receipt processed and saved!\n\n"
+            response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
+            response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
+            response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
+            response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n"
+            
+            items = receipt_data.get('items', 'Unknown')
+            if items and items != 'Unknown':
+                response += f"🛍️ Items: {items}\n"
+            
+            await processing_msg.delete()
+            await update.message.reply_text(response)
+            
+        except Exception as sheets_error:
+            logging.error(f"Google Sheets error: {sheets_error}")
+            # Even if Sheets fails, show the user what was extracted
+            response = "📄 Receipt processed successfully!\n\n"
+            response += f"🏪 Store: {receipt_data.get('store', 'Unknown')}\n"
+            response += f"📅 Date: {receipt_data.get('date', 'Unknown')}\n"
+            response += f"💰 Total: {receipt_data.get('currency', '')} {receipt_data.get('total_amount', 'Unknown')}\n"
+            response += f"💳 Type: {receipt_data.get('transaction_type', 'Unknown')}\n\n"
+            response += "⚠️ But couldn't save to spreadsheet. Check credentials."
+            
+            await processing_msg.delete()
+            await update.message.reply_text(response)
         
     except Exception as e:
         logging.error(f"Error processing receipt: {e}")
