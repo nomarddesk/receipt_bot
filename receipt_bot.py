@@ -2,7 +2,6 @@ import os
 import logging
 import json
 import base64
-import time
 from telegram import Update
 from telegram.ext import Application, CommandHandler, MessageHandler, filters, ContextTypes
 from PIL import Image
@@ -20,8 +19,7 @@ logging.basicConfig(
 # Configuration from environment variables
 BOT_TOKEN = os.getenv('BOT_TOKEN')
 OPENAI_API_KEY = os.getenv('OPENAI_API_KEY')
-SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')  # Use ID instead of name
-WORKSHEET_NAME = os.getenv('WORKSHEET_NAME', 'Sheet1')  # Default to 'Sheet1'
+SPREADSHEET_ID = os.getenv('SPREADSHEET_ID')  # Changed to SPREADSHEET_ID
 
 # Initialize OpenAI client
 def get_openai_client():
@@ -29,66 +27,44 @@ def get_openai_client():
         raise ValueError("OPENAI_API_KEY environment variable is not set!")
     return OpenAI(api_key=OPENAI_API_KEY)
 
-def initialize_google_sheet(max_retries=3):
-    """Initializes the gspread client and opens the spreadsheet by ID with retry logic."""
-    logging.info("Attempting to connect to Google Sheets...")
-    
-    # Use exponential backoff for API calls
-    for attempt in range(max_retries):
-        try:
-            # Find credentials file
-            possible_paths = [
-                '/etc/secrets/credentials.json',  # Render secret files path
-                'credentials.json',  # Local development
-                '/app/credentials.json',  # Absolute path in container
-            ]
-            
-            creds_path = None
-            for path in possible_paths:
-                if os.path.exists(path):
-                    creds_path = path
-                    logging.info(f"Found credentials at: {creds_path}")
-                    break
-            
-            if not creds_path:
-                raise FileNotFoundError(f"credentials.json not found in any of: {possible_paths}")
-            
-            if not SPREADSHEET_ID:
-                raise ValueError("SPREADSHEET_ID environment variable is not set!")
-            
-            # 1. Authenticate using the Service Account file
-            gc = gspread.service_account(filename=creds_path)
-            
-            # 2. Open the spreadsheet using the stable SPREADSHEET_ID
-            spreadsheet = gc.open_by_key(SPREADSHEET_ID)
-            
-            # 3. Select the specific worksheet/tab
-            worksheet = spreadsheet.worksheet(WORKSHEET_NAME)
-            
-            # Create headers if sheet is empty
-            if not worksheet.get_all_records():
-                worksheet.append_row(["Date", "Store/Merchant", "Total Amount", "Currency", "Transaction Type", "Items", "Timestamp"])
-            
-            logging.info(f"Google Sheets connection successful. Using Sheet ID: {SPREADSHEET_ID}")
-            return worksheet
+# For Render.com - we'll use the secret file path
+def setup_google_sheets():
+    try:
+        # On Render, secret files are mounted at /etc/secrets/
+        possible_paths = [
+            '/etc/secrets/credentials.json',  # Render secret files path
+            'credentials.json',  # Local development
+            '/app/credentials.json',  # Absolute path in container
+        ]
         
-        except gspread.exceptions.APIError as e:
-            logging.error(f"Google Sheets API Error on attempt {attempt + 1}: {e}")
-            if "PERMISSION_DENIED" in str(e):
-                logging.error("Permission denied. Please check if the service account has editor access to the spreadsheet.")
-                raise
-        except Exception as e:
-            logging.error(f"Error on attempt {attempt + 1}: {e}")
+        creds_path = None
+        for path in possible_paths:
+            if os.path.exists(path):
+                creds_path = path
+                logging.info(f"Found credentials at: {creds_path}")
+                break
+        
+        if not creds_path:
+            raise FileNotFoundError(f"credentials.json not found in any of: {possible_paths}")
+        
+        if not SPREADSHEET_ID:
+            raise ValueError("SPREADSHEET_ID environment variable is not set!")
             
-        if attempt < max_retries - 1:
-            # Wait before retrying (exponential backoff)
-            wait_time = 2 ** attempt
-            logging.info(f"Retrying in {wait_time} seconds...")
-            time.sleep(wait_time)
-        else:
-            # Failed all attempts
-            logging.error("Failed to connect to Google Sheets after multiple retries.")
-            raise
+        scope = ['https://www.googleapis.com/auth/spreadsheets']
+        creds = Credentials.from_service_account_file(creds_path, scopes=scope)
+        client = gspread.authorize(creds)
+        
+        # Open by ID instead of name - more reliable!
+        sheet = client.open_by_key(SPREADSHEET_ID).sheet1
+        
+        # Create headers if sheet is empty
+        if not sheet.get_all_records():
+            sheet.append_row(["Date", "Store/Merchant", "Total Amount", "Currency", "Transaction Type", "Items", "Timestamp"])
+        
+        return sheet
+    except Exception as e:
+        logging.error(f"Google Sheets setup error: {e}")
+        raise
 
 def extract_receipt_info_with_openai(image_bytes):
     """Extract receipt information using OpenAI GPT-4 Vision"""
@@ -292,7 +268,7 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE):
         
         # Save to Google Sheets
         try:
-            sheet = initialize_google_sheet()
+            sheet = setup_google_sheets()
             timestamp = update.message.date.strftime("%Y-%m-%d %H:%M:%S")
             
             row_data = [
